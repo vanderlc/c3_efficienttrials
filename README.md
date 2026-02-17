@@ -32,6 +32,6 @@ This repository evaluates those possibilities using subtest-level modeling and v
 
 ## Repository Structure
 
-code/ - R scripts for preprocessing, modeling, validation, and plotting
-data/ - datasets
-graphs/ - Generated figures, ROC curves, longitudinal plots, and summary visualizations
+- code/ - R scripts for preprocessing, modeling, validation, and plotting
+- data/ - datasets
+- graphs/ - Generated figures, ROC curves, longitudinal plots, and summary visualizations
