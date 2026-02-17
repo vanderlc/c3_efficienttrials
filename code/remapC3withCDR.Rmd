@@ -1,0 +1,645 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-02-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+#!/usr/bin/env Rscript
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(stringr)
+  library(lubridate)
+  library(tidyr)
+})
+
+# =========================
+# Config
+# =========================
+main_path <- "/Users/caseyvanderlip/Library/CloudStorage/OneDrive-SharedLibraries-UCIrvine/Starklab - Documents/Casey/A4/shortertrials/data/A4_cognition_clean.csv"
+cdr_path  <- "/Users/caseyvanderlip/Library/CloudStorage/OneDrive-SharedLibraries-UCIrvine/Starklab - Documents/Casey/A4/shortertrials/data/cdr.csv"
+out_path  <- "/Users/caseyvanderlip/Library/CloudStorage/OneDrive-SharedLibraries-UCIrvine/Starklab - Documents/Casey/A4/shortertrials/data/A4_CogstateRealigned_withCDR.csv"
+
+anchor_visits <- c(1, 18, 33, 48, 57, 66)
+anchor_window <- 5
+
+# =========================
+# Logging helpers
+# =========================
+ts <- function() format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+log_section <- function(title) {
+  cat("\n", strrep("=", 100), "\n", sep = "")
+  cat("[", ts(), "] ", title, "\n", sep = "")
+  cat(strrep("=", 100), "\n", sep = "")
+}
+log_kv <- function(k, v) cat(sprintf("[%s] %-38s %s\n", ts(), paste0(k, ":"), v))
+log_n  <- function(k, v) log_kv(k, format(v, big.mark = ","))
+
+peek_vals <- function(x, n = 8) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return("<<none>>")
+  paste(head(unique(x), n), collapse = " | ")
+}
+
+log_dups <- function(df, keys, name, top_n = 20) {
+  d <- df %>%
+    count(across(all_of(keys)), name = "n") %>%
+    filter(n > 1) %>%
+    arrange(desc(n))
+
+  log_section(paste0("DUPLICATE CHECK: ", name))
+  log_kv("Keys", paste(keys, collapse = ", "))
+  log_n("Rows", nrow(df))
+  log_n("Unique key combos", nrow(distinct(df, across(all_of(keys)))))
+  log_n("Duplicate key combos", nrow(d))
+  if (nrow(d) > 0) {
+    cat("\nTop duplicate key combos:\n")
+    print(head(d, top_n))
+  } else {
+    cat("No duplicate key combos detected.\n")
+  }
+  invisible(d)
+}
+
+# helper: pick nearest within window; tie -> smaller visit
+pick_nearest <- function(vv, anchor, window) {
+  vv <- vv[!is.na(vv)]
+  vv_win <- vv[abs(vv - anchor) <= window]
+  if (length(vv_win) == 0) return(NA_real_)
+  d <- abs(vv_win - anchor)
+  vv_win[order(d, vv_win)][1]
+}
+
+# =========================
+# Load
+# =========================
+log_section("LOAD DATA")
+log_kv("Reading main", main_path)
+main <- readr::read_csv(main_path, show_col_types = FALSE)
+log_kv("Reading cdr", cdr_path)
+cdr  <- readr::read_csv(cdr_path, show_col_types = FALSE)
+
+log_section("BASIC SHAPES")
+log_n("Main rows", nrow(main)); log_n("Main cols", ncol(main))
+log_n("CDR rows",  nrow(cdr));  log_n("CDR cols",  ncol(cdr))
+
+# =========================
+# Verify required columns
+# =========================
+log_section("VERIFY REQUIRED COLUMNS")
+if (!("VISIT" %in% names(main))) stop("Main file missing VISIT column.")
+if (!("BID" %in% names(main)))   stop("Main file missing BID column.")
+if (!("BID" %in% names(cdr)))    stop("CDR file missing BID column.")
+
+if (!("AVISIT" %in% names(cdr))) {
+  if ("VISIT" %in% names(cdr)) {
+    log_kv("AVISIT", "Not found; using VISIT as AVISIT")
+    cdr <- cdr %>% mutate(AVISIT = VISIT)
+  } else {
+    stop("CDR file missing AVISIT (and no VISIT fallback found).")
+  }
+}
+if (!("CDGLOBAL" %in% names(cdr))) stop("CDR file missing CDGLOBAL column.")
+
+# =========================
+# Keep BID as string
+# =========================
+log_section("STANDARDIZE BID (KEEP AS CHARACTER)")
+log_kv("Main BID examples (before)", peek_vals(main$BID))
+log_kv("CDR  BID examples (before)", peek_vals(cdr$BID))
+
+main <- main %>% mutate(BID = str_trim(as.character(BID)))
+cdr  <- cdr  %>% mutate(BID = str_trim(as.character(BID)))
+
+log_kv("Main BID examples (after)", peek_vals(main$BID))
+log_kv("CDR  BID examples (after)", peek_vals(cdr$BID))
+log_n("Main BID missing/blank", sum(is.na(main$BID) | main$BID == ""))
+log_n("CDR  BID missing/blank", sum(is.na(cdr$BID)  | cdr$BID == ""))
+
+# =========================
+# Coerce visits to numeric
+# =========================
+log_section("COERCE VISIT FIELDS TO NUMERIC (BID STAYS CHARACTER)")
+main <- main %>% mutate(VISIT = suppressWarnings(as.numeric(VISIT)))
+cdr  <- cdr  %>% mutate(AVISIT = suppressWarnings(as.numeric(AVISIT)))
+
+log_n("Main VISIT missing after numeric", sum(is.na(main$VISIT)))
+log_n("CDR  AVISIT missing after numeric", sum(is.na(cdr$AVISIT)))
+if (sum(is.na(cdr$AVISIT)) > 0) {
+  log_kv("Note", "CDR has non-numeric/blank AVISIT rows; they will be ignored for remap logic")
+}
+
+# =========================
+# MAIN VISIT_remap
+# - shift VISIT > 3 by +3
+# - EXCEPT VISIT==33 stays 33 (no shift)
+# - EXCEPT VISIT==57 stays 57 (no shift)
+# =========================
+log_section("CREATE MAIN VISIT_remap (NO SHIFT FOR VISIT==33 OR VISIT==57)")
+main <- main %>%
+  mutate(
+    VISIT_remap = case_when(
+  is.na(VISIT)      ~ NA_real_,
+      VISIT %in% c(33, 57) ~ VISIT,     # keep as-is
+      VISIT > 3            ~ VISIT + 3,
+      TRUE                 ~ VISIT
+    )
+  )
+log_n("Main VISIT_remap missing", sum(is.na(main$VISIT_remap)))
+
+# =========================
+# CDR AVISIT_remap (shift nearby to missing anchors within +/-5)
+# =========================
+log_section("CREATE CDR AVISIT_remap (SHIFT NEARBY TO MISSING ANCHORS)")
+log_kv("Anchor visits", paste(anchor_visits, collapse = ", "))
+log_kv("Window (+/- visits)", anchor_window)
+
+cdr <- cdr %>% mutate(AVISIT_remap = AVISIT)
+
+# Work only with valid numeric AVISIT for mapping
+cdr_key <- cdr %>%
+  filter(!is.na(AVISIT), BID != "") %>%
+  select(BID, AVISIT) %>%
+  distinct()
+
+log_n("Distinct (BID, AVISIT) pairs", nrow(cdr_key))
+log_n("Unique BID with any numeric AVISIT", nrow(distinct(cdr_key, BID)))
+
+# Build per-BID list of visits
+vis_list <- cdr_key %>%
+  group_by(BID) %>%
+  summarize(visits = list(sort(unique(AVISIT))), .groups = "drop")
+
+# For each BID x anchor, determine if anchor missing; if missing pick nearest within window
+candidates <- vis_list %>%
+  tidyr::crossing(anchor = anchor_visits) %>%
+  rowwise() %>%
+  mutate(
+    has_anchor = anchor %in% visits,
+    best_avisit = if (has_anchor) NA_real_ else pick_nearest(visits, anchor, anchor_window),
+    best_dist = if (is.na(best_avisit)) NA_real_ else abs(best_avisit - anchor)
+  ) %>%
+  ungroup() %>%
+  filter(!has_anchor, !is.na(best_avisit)) %>%
+  arrange(BID, anchor)
+
+log_section("CDR REMAP CANDIDATES")
+log_n("Total candidate remaps", nrow(candidates))
+if (nrow(candidates) > 0) {
+  cat("\nFirst 30 candidate remaps (BID, best_avisit -> anchor, dist):\n")
+  print(head(candidates %>% select(BID, best_avisit, anchor, best_dist), 30))
+}
+
+# If multiple anchors pick the same best_avisit for a BID, keep closest (tie -> smaller anchor)
+remap_table <- candidates %>%
+  group_by(BID, best_avisit) %>%
+  arrange(best_dist, anchor, .by_group = TRUE) %>%
+  slice(1) %>%
+  ungroup() %>%
+  transmute(BID, AVISIT = best_avisit, AVISIT_remap_new = anchor)
+
+log_section("REMAPPING TABLE (APPLIED)")
+log_n("Rows in remap table", nrow(remap_table))
+if (nrow(remap_table) > 0) {
+  cat("\nFirst 30 applied remaps (BID, AVISIT -> AVISIT_remap_new):\n")
+  print(head(remap_table, 30))
+}
+
+# Apply remap to cdr rows
+if (nrow(remap_table) > 0) {
+  cdr <- cdr %>%
+    left_join(remap_table, by = c("BID", "AVISIT")) %>%
+    mutate(AVISIT_remap = if_else(!is.na(AVISIT_remap_new), AVISIT_remap_new, AVISIT_remap)) %>%
+    select(-AVISIT_remap_new)
+}
+
+log_section("POST-REMAP DUP CHECK (CDR KEYSPACE)")
+cdr_dups_remap <- log_dups(
+  cdr %>% filter(!is.na(AVISIT_remap)),
+  c("BID", "AVISIT_remap"),
+  "CDR (BID, AVISIT_remap)"
+)
+
+# =========================
+# Deduplicate CDR to 1 row per (BID, AVISIT_remap)
+# =========================
+log_section("DEDUPLICATE CDR TO ONE ROW PER (BID, AVISIT_remap)")
+
+date_candidates <- intersect(
+  names(cdr),
+  c("EXAMDATE", "CDRDATE", "VISITDATE", "DATE", "CDADTC_DAYS_CONSENT", "CDADTC_DAYS_T0", "CDDY")
+)
+log_kv("Date candidates found", if (length(date_candidates) == 0) "NONE" else paste(date_candidates, collapse = ", "))
+
+cdr_value_cols <- setdiff(
+  names(cdr),
+  c("SUBSTUDY","BID","VISCODE","DONE","NDREASON","CDSPVERS","CDPTSRCE","CDSPSRCE","BPID",
+    "AVISIT","AVISIT_remap","EPOCH","CDEVENT","CDOLEEVENT")
+)
+
+cdr_dedup <- cdr %>%
+  mutate(
+    .nonmiss = rowSums(!is.na(across(any_of(cdr_value_cols)))),
+    .row_id = row_number()
+  )
+
+if (length(date_candidates) > 0) {
+  numeric_days <- date_candidates[date_candidates %in% c("CDADTC_DAYS_CONSENT", "CDADTC_DAYS_T0", "CDDY")]
+  if (length(numeric_days) > 0) {
+    order_col <- numeric_days[1]
+    log_kv("Ordering duplicates by", paste0(order_col, " (largest kept), then non-missing"))
+    cdr_dedup <- cdr_dedup %>%
+      group_by(BID, AVISIT_remap) %>%
+      arrange(desc(.data[[order_col]]), desc(.nonmiss), desc(.row_id), .by_group = TRUE) %>%
+      slice(1) %>%
+      ungroup()
+  } else {
+    order_col <- date_candidates[1]
+    log_kv("Ordering duplicates by", paste0(order_col, " (latest date kept if parseable), then non-missing"))
+    cdr_dedup <- cdr_dedup %>%
+      mutate(.parsed_date = suppressWarnings(lubridate::ymd(.data[[order_col]]))) %>%
+      group_by(BID, AVISIT_remap) %>%
+      arrange(desc(.parsed_date), desc(.nonmiss), desc(.row_id), .by_group = TRUE) %>%
+      slice(1) %>%
+      ungroup() %>%
+      select(-.parsed_date)
+  }
+} else {
+  log_kv("Ordering duplicates by", "most non-missing CDR fields, then last row")
+  cdr_dedup <- cdr_dedup %>%
+    group_by(BID, AVISIT_remap) %>%
+    arrange(desc(.nonmiss), desc(.row_id), .by_group = TRUE) %>%
+    slice(1) %>%
+    ungroup()
+}
+
+cdr_dedup <- cdr_dedup %>% select(-.nonmiss, -.row_id)
+
+log_section("POST-DEDUP CHECK (CDR)")
+log_n("CDR rows before", nrow(cdr))
+log_n("CDR rows after ", nrow(cdr_dedup))
+cdr_dups_after <- log_dups(
+  cdr_dedup %>% filter(!is.na(AVISIT_remap)),
+  c("BID","AVISIT_remap"),
+  "CDR_DEDUP (BID, AVISIT_remap)"
+)
+if (nrow(cdr_dups_after) > 0) stop("CDR still has duplicate (BID, AVISIT_remap) after dedup. Inspect log.")
+
+# =========================
+# Join ON REMAPPED VISITS
+# =========================
+log_section("LEFT JOIN USING REMAPPED VISITS")
+log_kv("Join keys", "main(BID, VISIT_remap) -> cdr(BID, AVISIT_remap)")
+
+merged <- main %>%
+  left_join(
+    cdr_dedup,
+    by = c("BID" = "BID", "VISIT_remap" = "AVISIT_remap"),
+    suffix = c("", "_CDR")
+  )
+
+log_section("MERGE SANITY CHECKS")
+log_n("Rows main", nrow(main))
+log_n("Rows merged", nrow(merged))
+if (nrow(merged) != nrow(main)) log_kv("WARNING", "Row count changed (should not happen for many-to-one join).")
+
+candidate_match_cols <- intersect(names(merged), c("CDRSB", "CDSOB", "CDGLOBAL"))
+match_col <- if (length(candidate_match_cols) > 0) candidate_match_cols[1] else NA_character_
+log_kv("Match column", if (is.na(match_col)) "NONE FOUND (CDRSB/CDSOB/CDGLOBAL)" else match_col)
+if (!is.na(match_col)) {
+  log_n("Matched rows (non-missing)", sum(!is.na(merged[[match_col]])))
+  log_n("Unmatched rows (missing)", sum(is.na(merged[[match_col]])))
+}
+
+log_section("KEY COVERAGE")
+log_n("Unique keys in main (BID,VISIT_remap)", merged %>% distinct(BID, VISIT_remap) %>% nrow())
+log_n("Unique keys in cdr  (BID,AVISIT_remap)", cdr_dedup %>% distinct(BID, AVISIT_remap) %>% nrow())
+
+# =========================
+# Write output
+# =========================
+log_section("WRITE OUTPUT")
+log_kv("Writing CSV", out_path)
+readr::write_csv(merged, out_path)
+log_kv("Done", "✅ Saved merged file")
+
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+# ============================================================
+# Plot counts of non-missing C3 vs non-missing CDGLOBAL by visit
+#   Plot 1: C3 counted by VISIT (main), CDGLOBAL counted by AVISIT_remap (cdr)
+#   Plot 2: C3 counted by VISIT_remap (main), CDGLOBAL counted by AVISIT_remap (cdr)
+# Filters: SUBSTUDY == "A4" (in cdr; and in main if SUBSTUDY exists)
+# Graph tweaks: NO TITLE, x label = "Visit"
+#
+# Updates applied:
+#  - MAIN VISIT_remap: VISIT>3 add 3 EXCEPT VISIT==33 stays 33, and VISIT==57 stays 57 (no shift)
+#  - CDR AVISIT_remap: if subject missing CDR at anchor visits {1,18,33,48,66}
+#    and has a CDR within +/-5 visits, remap nearest visit to the anchor.
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(stringr)
+})
+
+# -----------------------
+# Paths (edit as needed)
+# -----------------------
+main_path <- "/Users/caseyvanderlip/Library/CloudStorage/OneDrive-SharedLibraries-UCIrvine/Starklab - Documents/Casey/A4/shortertrials/data/A4_cognition_clean.csv"
+cdr_path  <- "/Users/caseyvanderlip/Library/CloudStorage/OneDrive-SharedLibraries-UCIrvine/Starklab - Documents/Casey/A4/shortertrials/data/cdr.csv"
+
+out_png1  <- "/Users/caseyvanderlip/Library/CloudStorage/OneDrive-SharedLibraries-UCIrvine/Starklab - Documents/Casey/A4/shortertrials/data/counts_C3_vs_CDGLOBAL_by_VISIT_A4.png"
+out_png2  <- "/Users/caseyvanderlip/Library/CloudStorage/OneDrive-SharedLibraries-UCIrvine/Starklab - Documents/Casey/A4/shortertrials/data/counts_C3remap_vs_CDGLOBAL_by_VISIT_A4.png"
+
+# -----------------------
+# Remap rules
+# -----------------------
+anchor_visits <- c(1, 18, 33, 48, 66)
+anchor_window <- 5
+no_shift_visits_main <- c(33, 57)  # <-- NEW: don't shift these in C3/main VISIT_remap
+
+# -----------------------
+# Logging helpers
+# -----------------------
+ts <- function() format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+log_section <- function(title) {
+  cat("\n", strrep("=", 90), "\n", sep = "")
+  cat("[", ts(), "] ", title, "\n", sep = "")
+  cat(strrep("=", 90), "\n", sep = "")
+}
+log_kv <- function(k, v) cat(sprintf("[%s] %-30s %s\n", ts(), paste0(k, ":"), v))
+log_n  <- function(k, v) log_kv(k, format(v, big.mark = ","))
+
+pick_nearest <- function(vv, anchor, window) {
+  vv <- vv[!is.na(vv)]
+  vv_win <- vv[abs(vv - anchor) <= window]
+  if (length(vv_win) == 0) return(NA_real_)
+  d <- abs(vv_win - anchor)
+  vv_win[order(d, vv_win)][1] # tie -> smaller visit
+}
+
+# -----------------------
+# Load
+# -----------------------
+log_section("LOAD")
+log_kv("Reading main", main_path)
+main <- read_csv(main_path, show_col_types = FALSE)
+
+log_kv("Reading cdr", cdr_path)
+cdr  <- read_csv(cdr_path, show_col_types = FALSE)
+
+log_section("BASIC SHAPES (RAW)")
+log_n("Main rows", nrow(main)); log_n("Main cols", ncol(main))
+log_n("CDR rows",  nrow(cdr));  log_n("CDR cols",  ncol(cdr))
+
+# -----------------------
+# Filter to SUBSTUDY == A4 (where available)
+# -----------------------
+log_section("FILTER TO SUBSTUDY == A4")
+
+if ("SUBSTUDY" %in% names(main)) {
+  before <- nrow(main)
+  main <- main %>% filter(SUBSTUDY == "A4")
+  log_n("Main rows before SUBSTUDY filter", before)
+  log_n("Main rows after  SUBSTUDY filter", nrow(main))
+} else {
+  log_kv("Main SUBSTUDY column", "Not present; skipping main SUBSTUDY filter")
+}
+
+if (!("SUBSTUDY" %in% names(cdr))) stop("CDR file missing SUBSTUDY column; cannot filter to A4.")
+before <- nrow(cdr)
+cdr <- cdr %>% filter(SUBSTUDY == "A4")
+log_n("CDR rows before SUBSTUDY filter", before)
+log_n("CDR rows after  SUBSTUDY filter", nrow(cdr))
+
+# -----------------------
+# Validate required columns
+# -----------------------
+log_section("VERIFY REQUIRED COLUMNS")
+req_main <- c("BID", "VISIT", "C3")
+missing_main <- setdiff(req_main, names(main))
+if (length(missing_main) > 0) stop("Main missing columns: ", paste(missing_main, collapse = ", "))
+
+if (!("AVISIT" %in% names(cdr))) {
+  if ("VISIT" %in% names(cdr)) {
+    log_kv("CDR AVISIT", "Not found; using VISIT as AVISIT")
+    cdr <- cdr %>% mutate(AVISIT = VISIT)
+  } else {
+    stop("CDR missing AVISIT (and no VISIT fallback found).")
+  }
+}
+
+req_cdr <- c("BID", "AVISIT", "CDGLOBAL")
+missing_cdr <- setdiff(req_cdr, names(cdr))
+if (length(missing_cdr) > 0) stop("CDR missing columns: ", paste(missing_cdr, collapse = ", "))
+
+# -----------------------
+# Standardize BID as character
+# -----------------------
+log_section("STANDARDIZE BID")
+main <- main %>% mutate(BID = str_trim(as.character(BID)))
+cdr  <- cdr  %>% mutate(BID = str_trim(as.character(BID)))
+
+log_n("Main BID blank", sum(is.na(main$BID) | main$BID == ""))
+log_n("CDR  BID blank", sum(is.na(cdr$BID)  | cdr$BID == ""))
+
+# -----------------------
+# Coerce visit variables to numeric
+# -----------------------
+log_section("COERCE VISIT FIELDS")
+main <- main %>% mutate(VISIT = suppressWarnings(as.numeric(VISIT)))
+cdr  <- cdr  %>% mutate(AVISIT = suppressWarnings(as.numeric(AVISIT)))
+
+log_n("Main VISIT missing", sum(is.na(main$VISIT)))
+log_n("CDR  AVISIT missing", sum(is.na(cdr$AVISIT)))
+if (sum(is.na(cdr$AVISIT)) > 0) {
+  log_kv("Note", "CDR has non-numeric/blank AVISIT rows; ignored for AVISIT_remap + counts")
+}
+
+# -----------------------
+# MAIN: create VISIT_remap with exceptions for VISIT==33 and VISIT==57
+# -----------------------
+log_section("CREATE MAIN VISIT_remap (NO SHIFT FOR VISIT==33 OR VISIT==57)")
+log_kv("Main no-shift visits", paste(no_shift_visits_main, collapse = ", "))
+
+main <- main %>%
+  mutate(
+    VISIT_remap = case_when(
+      is.na(VISIT) ~ NA_real_,
+      VISIT %in% no_shift_visits_main ~ VISIT,
+      VISIT > 3   ~ VISIT + 3,
+      TRUE        ~ VISIT
+    )
+  )
+
+log_n("Main VISIT_remap missing", sum(is.na(main$VISIT_remap)))
+
+# -----------------------
+# CDR: create AVISIT_remap using anchor-shift rule
+# -----------------------
+log_section("CREATE CDR AVISIT_remap (SHIFT NEARBY TO MISSING ANCHORS)")
+log_kv("Anchor visits", paste(anchor_visits, collapse = ", "))
+log_kv("Window (+/- visits)", anchor_window)
+
+cdr <- cdr %>% mutate(AVISIT_remap = AVISIT)
+
+cdr_key <- cdr %>%
+  filter(!is.na(AVISIT), BID != "") %>%
+  select(BID, AVISIT) %>%
+  distinct()
+
+vis_list <- cdr_key %>%
+  group_by(BID) %>%
+  summarize(visits = list(sort(unique(AVISIT))), .groups = "drop")
+
+candidates <- vis_list %>%
+  tidyr::crossing(anchor = anchor_visits) %>%
+  rowwise() %>%
+  mutate(
+    has_anchor = anchor %in% visits,
+    best_avisit = if (has_anchor) NA_real_ else pick_nearest(visits, anchor, anchor_window),
+    best_dist = if (is.na(best_avisit)) NA_real_ else abs(best_avisit - anchor)
+  ) %>%
+  ungroup() %>%
+  filter(!has_anchor, !is.na(best_avisit)) %>%
+  arrange(BID, anchor)
+
+log_n("Total candidate remaps", nrow(candidates))
+
+remap_table <- candidates %>%
+  group_by(BID, best_avisit) %>%
+  arrange(best_dist, anchor, .by_group = TRUE) %>%
+  slice(1) %>%
+  ungroup() %>%
+  transmute(BID, AVISIT = best_avisit, AVISIT_remap_new = anchor)
+
+log_n("Rows in remap table", nrow(remap_table))
+
+if (nrow(remap_table) > 0) {
+  cdr <- cdr %>%
+    left_join(remap_table, by = c("BID", "AVISIT")) %>%
+    mutate(AVISIT_remap = if_else(!is.na(AVISIT_remap_new), AVISIT_remap_new, AVISIT_remap)) %>%
+    select(-AVISIT_remap_new)
+}
+
+log_n("CDR AVISIT_remap missing", sum(is.na(cdr$AVISIT_remap)))
+
+# ============================================================
+# Helper to build long count table for a plot
+# ============================================================
+build_counts <- function(main_visit_col = c("VISIT", "VISIT_remap")) {
+  main_visit_col <- match.arg(main_visit_col)
+
+  c3_counts <- main %>%
+    filter(!is.na(.data[[main_visit_col]])) %>%
+    summarize(
+      n_rows = n(),
+      n_nonmiss = sum(!is.na(C3)),
+      n_missing = sum(is.na(C3))
+    )
+
+  log_section(paste0("C3 COMPLETENESS CHECK (grouping by ", main_visit_col, ")"))
+  log_n("Main total rows", c3_counts$n_rows)
+  log_n("C3 non-missing", c3_counts$n_nonmiss)
+  log_n("C3 missing",     c3_counts$n_missing)
+
+  c3_by_visit <- main %>%
+    filter(!is.na(.data[[main_visit_col]])) %>%
+    group_by(visit = .data[[main_visit_col]]) %>%
+    summarize(count = sum(!is.na(C3)), .groups = "drop") %>%
+    mutate(measure = "C3")
+
+  cdg_check <- cdr %>%
+    filter(!is.na(AVISIT_remap)) %>%
+    summarize(
+      n_rows = n(),
+      n_nonmiss = sum(!is.na(CDGLOBAL)),
+      n_missing = sum(is.na(CDGLOBAL))
+    )
+
+  log_section("CDGLOBAL COMPLETENESS CHECK (grouping by AVISIT_remap)")
+  log_n("CDR total rows (non-missing AVISIT_remap)", cdg_check$n_rows)
+  log_n("CDGLOBAL non-missing", cdg_check$n_nonmiss)
+  log_n("CDGLOBAL missing",     cdg_check$n_missing)
+
+  cdg_by_visit <- cdr %>%
+    filter(!is.na(AVISIT_remap)) %>%
+    group_by(visit = AVISIT_remap) %>%
+    summarize(count = sum(!is.na(CDGLOBAL)), .groups = "drop") %>%
+    mutate(measure = "CDGLOBAL")
+
+  out <- bind_rows(c3_by_visit, cdg_by_visit) %>%
+    mutate(visit = as.numeric(visit)) %>%
+    complete(visit = sort(unique(visit)), measure, fill = list(count = 0)) %>%
+    arrange(visit, measure)
+
+  log_section(paste0("COUNTS TABLE READY (C3 by ", main_visit_col, " + CDGLOBAL by AVISIT_remap)"))
+  log_n("Unique visits in output", length(unique(out$visit)))
+  log_n("Rows in output (visit x measure)", nrow(out))
+
+  out
+}
+
+# ============================================================
+# Plot 1
+# ============================================================
+log_section("BUILD + PLOT 1: VISIT (C3) vs AVISIT_remap (CDGLOBAL)")
+dat1 <- build_counts("VISIT")
+
+p1 <- ggplot(dat1, aes(x = factor(visit), y = count, fill = measure)) +
+  geom_col(position = position_dodge(width = 0.9), width = 0.85) +
+  labs(title = NULL, x = "Visit", y = "Count (non-missing)", fill = "Measure") +
+  theme_bw() +
+  theme(
+    plot.title = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)
+  )
+
+log_kv("Saving plot 1", out_png1)
+ggsave(out_png1, p1, width = 14, height = 6, dpi = 300)
+
+# ============================================================
+# Plot 2
+# ============================================================
+log_section("BUILD + PLOT 2: VISIT_remap (C3) vs AVISIT_remap (CDGLOBAL)")
+dat2 <- build_counts("VISIT_remap")
+
+p2 <- ggplot(dat2, aes(x = factor(visit), y = count, fill = measure)) +
+  geom_col(position = position_dodge(width = 0.9), width = 0.85) +
+  labs(title = NULL, x = "Visit", y = "Count (non-missing)", fill = "Measure") +
+  theme_bw() +
+  theme(
+    plot.title = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)
+  )
+
+log_kv("Saving plot 2", out_png2)
+ggsave(out_png2, p2, width = 14, height = 6, dpi = 300)
+
+log_section("DONE")
+log_kv("Plot 1 saved", out_png1)
+log_kv("Plot 2 saved", out_png2)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
