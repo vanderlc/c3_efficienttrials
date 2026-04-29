@@ -1,0 +1,698 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-04-29"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r compile csvs into one}
+#!/usr/bin/env Rscript
+
+# ============================================================
+# Merge A4 cognition + CDR by subject and visit
+#   - Full outer join on BID + visit code
+#   - Harmonizes cognition VISIT to VISCODE
+#   - Adds BaselinepTau217 = first available ORRESRAW per BID
+#     using the lowest numeric VISCODE in biomarker file
+#   - Saves merged dataset
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(stringr)
+  library(tidyr)
+})
+
+# ============================================================
+# PATHS
+# ============================================================
+
+cog_path <- '/Users/caseyvanderlip/Library/CloudStorage/OneDrive-SharedLibraries-UCIrvine/Starklab - Documents/Casey/A4/shortertrials/data/A4_cognition_clean.csv'
+cdr_path <- '/Users/caseyvanderlip/Library/CloudStorage/OneDrive-SharedLibraries-UCIrvine/Starklab - Documents/Casey/A4/shortertrials/data/cdr.csv'
+ptau_path <- '/Users/caseyvanderlip/Library/CloudStorage/OneDrive-SharedLibraries-UCIrvine/Starklab - Documents/Casey/A4/A4_Study_Data/External Data/biomarker_pTau217.csv'
+
+outdir <- "/Users/caseyvanderlip/Library/CloudStorage/OneDrive-SharedLibraries-UCIrvine/Starklab - Documents/Casey/A4/shortertrials/data"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+outfile <- file.path(outdir, "A4_c3_cdr_baseline_ptau217.csv")
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+clean_viscode <- function(x) {
+  # Handles values like 1, "1", "V01", "v04", "sc1b", etc.
+  # For standard numeric visit codes, returns numeric value.
+  x_chr <- as.character(x)
+  x_num <- suppressWarnings(as.numeric(x_chr))
+  
+  needs_parse <- is.na(x_num) & !is.na(x_chr)
+  x_num[needs_parse] <- suppressWarnings(
+    as.numeric(str_extract(x_chr[needs_parse], "\\d+"))
+  )
+  
+  x_num
+}
+
+# ============================================================
+# READ FILES
+# ============================================================
+
+cog <- read_csv(cog_path, show_col_types = FALSE)
+cdr <- read_csv(cdr_path, show_col_types = FALSE)
+ptau <- read_csv(ptau_path, show_col_types = FALSE)
+
+cat("\n[INFO] Cognition rows:", nrow(cog), " cols:", ncol(cog), "\n")
+cat("[INFO] CDR rows:", nrow(cdr), " cols:", ncol(cdr), "\n")
+cat("[INFO] pTau rows:", nrow(ptau), " cols:", ncol(ptau), "\n")
+
+# ============================================================
+# STANDARDIZE IDs AND VISIT CODES
+# ============================================================
+
+cog_clean <- cog %>%
+  mutate(
+    BID = as.character(BID),
+    VISCODE = clean_viscode(VISIT)
+  )
+
+cdr_clean <- cdr %>%
+  mutate(
+    BID = as.character(BID),
+    VISCODE = clean_viscode(VISCODE)
+  )
+
+ptau_clean <- ptau %>%
+  mutate(
+    BID = as.character(BID),
+    VISCODE = clean_viscode(VISCODE),
+    ORRESRAW = suppressWarnings(as.numeric(ORRESRAW))
+  )
+
+# ============================================================
+# CHECK FOR DUPLICATES BEFORE MERGE
+# ============================================================
+
+cog_dupes <- cog_clean %>%
+  count(BID, VISCODE) %>%
+  filter(n > 1)
+
+cdr_dupes <- cdr_clean %>%
+  count(BID, VISCODE) %>%
+  filter(n > 1)
+
+cat("\n[INFO] Duplicate BID/VISCODE rows in cognition:", nrow(cog_dupes), "\n")
+cat("[INFO] Duplicate BID/VISCODE rows in CDR:", nrow(cdr_dupes), "\n")
+
+if (nrow(cog_dupes) > 0) {
+  cat("[WARN] Cognition has duplicate BID/VISCODE rows. Keeping first row per BID/VISCODE.\n")
+}
+
+if (nrow(cdr_dupes) > 0) {
+  cat("[WARN] CDR has duplicate BID/VISCODE rows. Keeping first row per BID/VISCODE.\n")
+}
+
+cog_one <- cog_clean %>%
+  arrange(BID, VISCODE) %>%
+  group_by(BID, VISCODE) %>%
+  slice(1) %>%
+  ungroup()
+
+cdr_one <- cdr_clean %>%
+  arrange(BID, VISCODE) %>%
+  group_by(BID, VISCODE) %>%
+  slice(1) %>%
+  ungroup()
+
+# ============================================================
+# CREATE BASELINE PTAU217
+# ============================================================
+# BaselinepTau217 = first non-missing ORRESRAW per subject,
+# ordered by lowest VISCODE.
+# If there are multiple rows at the same VISCODE, uses the first.
+
+baseline_ptau <- ptau_clean %>%
+  filter(!is.na(BID), !is.na(VISCODE), !is.na(ORRESRAW)) %>%
+  arrange(BID, VISCODE) %>%
+  group_by(BID) %>%
+  summarise(
+    BaselinepTau217 = first(ORRESRAW),
+    BaselinepTau217_VISCODE = first(VISCODE),
+    .groups = "drop"
+  )
+
+cat("\n[INFO] Subjects with baseline pTau217:", nrow(baseline_ptau), "\n")
+
+# ============================================================
+# FULL OUTER MERGE COGNITION + CDR
+# ============================================================
+
+merged <- full_join(
+  cog_one,
+  cdr_one,
+  by = c("BID", "VISCODE"),
+  suffix = c("_cog", "_cdr")
+) %>%
+  left_join(baseline_ptau, by = "BID") %>%
+  arrange(BID, VISCODE)
+
+# ============================================================
+# OPTIONAL CLEANUP
+# ============================================================
+# Keep original VISIT from cognition if present, but VISCODE is the merged visit variable.
+# You can uncomment this if you do not want special visits:
+#
+# merged <- merged %>%
+#   filter(is.na(VISCODE) | VISCODE < 997)
+
+# ============================================================
+# QUICK SUMMARY
+# ============================================================
+
+cat("\n[INFO] Final merged rows:", nrow(merged), "\n")
+cat("[INFO] Final merged cols:", ncol(merged), "\n")
+cat("[INFO] Unique subjects:", n_distinct(merged$BID), "\n")
+
+cat("\n[INFO] Rows with cognition data:",
+    sum(!is.na(merged$C3) | !is.na(merged$C3Mem) | !is.na(merged$C3NonMem)),
+    "\n")
+
+cat("[INFO] Rows with CDR data:",
+    sum(!is.na(merged$CDRSB) | !is.na(merged$CDGLOBAL)),
+    "\n")
+
+cat("[INFO] Rows with BaselinepTau217:",
+    sum(!is.na(merged$BaselinepTau217)),
+    "\n")
+
+cat("\n[INFO] Baseline pTau217 visit distribution:\n")
+print(
+  merged %>%
+    distinct(BID, BaselinepTau217_VISCODE) %>%
+    count(BaselinepTau217_VISCODE, sort = TRUE)
+)
+
+# ============================================================
+# SAVE
+# ============================================================
+
+write_csv(merged, outfile)
+
+cat("\n[DONE] Saved merged file to:\n", outfile, "\n")
+
+
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r correlate C3 with ptau217, echo=FALSE}
+#!/usr/bin/env Rscript
+
+# ============================================================
+# Correlate baseline C3 measures with baseline pTau217
+#   - Uses merged CSV: A4_c3_cdr_baseline_ptau217.csv
+#   - Keeps baseline cognition rows only
+#   - Baseline cognition = lowest non-special VISCODE per BID with cognition data
+#   - Faceted scatterplot
+#   - Prints plot only; does not save
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(purrr)
+  library(tibble)
+})
+
+# ============================================================
+# PATH
+# ============================================================
+
+infile <- "/Users/caseyvanderlip/Library/CloudStorage/OneDrive-SharedLibraries-UCIrvine/Starklab - Documents/Casey/A4/shortertrials/data/A4_c3_cdr_baseline_ptau217.csv"
+
+# ============================================================
+# VARIABLES
+# ============================================================
+
+c3_vars <- c(
+  "BPXT",
+  "FNMT",
+  "OCL",
+  "DET",
+  "IDN",
+  "ONB",
+  "C3",
+  "C3Mem",
+  "C3NonMem"
+)
+
+measure_labels <- c(
+  BPXT = "BPXT",
+  FNMT = "FNMT",
+  OCL = "OCL",
+  DET = "DET",
+  IDN = "IDN",
+  ONB = "ONB",
+  C3 = "C3",
+  C3Mem = "C3 Memory",
+  C3NonMem = "C3 Non-Memory"
+)
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+safe_cor_test <- function(dat) {
+  dat <- dat %>%
+    filter(!is.na(BaselinepTau217), !is.na(score))
+  
+  if (nrow(dat) < 3) {
+    return(tibble(
+      n = nrow(dat),
+      r = NA_real_,
+      p = NA_real_
+    ))
+  }
+  
+  test <- suppressWarnings(
+    cor.test(dat$BaselinepTau217, dat$score, method = "pearson")
+  )
+  
+  tibble(
+    n = nrow(dat),
+    r = unname(test$estimate),
+    p = test$p.value
+  )
+}
+
+format_p <- function(p) {
+  case_when(
+    is.na(p) ~ "p = NA",
+    p < 0.001 ~ "p < 0.001",
+    TRUE ~ paste0("p = ", formatC(p, format = "f", digits = 3))
+  )
+}
+
+# ============================================================
+# READ
+# ============================================================
+
+dat <- read_csv(infile, show_col_types = FALSE)
+
+missing_vars <- setdiff(c(c3_vars, "BID", "VISCODE", "BaselinepTau217"), names(dat))
+
+if (length(missing_vars) > 0) {
+  stop(
+    "Missing required columns from merged file: ",
+    paste(missing_vars, collapse = ", ")
+  )
+}
+
+# ============================================================
+# BASELINE COGNITION ROW PER SUBJECT
+# ============================================================
+# Uses lowest non-special VISCODE with at least one C3 measure present.
+# Excludes 997 and 999 from baseline cognition selection.
+
+baseline_dat <- dat %>%
+  mutate(
+    BID = as.character(BID),
+    VISCODE = suppressWarnings(as.numeric(VISCODE)),
+    BaselinepTau217 = suppressWarnings(as.numeric(BaselinepTau217))
+  ) %>%
+  filter(
+    !is.na(BID),
+    !is.na(VISCODE),
+    VISCODE < 997,
+    !is.na(BaselinepTau217)
+  ) %>%
+  filter(if_any(all_of(c3_vars), ~ !is.na(.x))) %>%
+  arrange(BID, VISCODE) %>%
+  group_by(BID) %>%
+  slice(1) %>%
+  ungroup()
+
+cat("\n[INFO] Baseline rows used:", nrow(baseline_dat), "\n")
+cat("[INFO] Unique subjects used:", n_distinct(baseline_dat$BID), "\n")
+
+# ============================================================
+# LONG FORMAT
+# ============================================================
+
+plot_dat <- baseline_dat %>%
+  select(BID, VISCODE, BaselinepTau217, all_of(c3_vars)) %>%
+  pivot_longer(
+    cols = all_of(c3_vars),
+    names_to = "measure",
+    values_to = "score"
+  ) %>%
+  mutate(
+    score = suppressWarnings(as.numeric(score)),
+    measure = factor(measure, levels = c3_vars, labels = measure_labels[c3_vars])
+  ) %>%
+  filter(!is.na(BaselinepTau217), !is.na(score))
+
+# ============================================================
+# CORRELATIONS
+# ============================================================
+
+cor_labels <- plot_dat %>%
+  group_by(measure) %>%
+  group_modify(~ safe_cor_test(.x)) %>%
+  ungroup() %>%
+  mutate(
+    label = paste0(
+      "r = ", formatC(r, format = "f", digits = 2),
+      "\n", format_p(p),
+      "\nn = ", n
+    )
+  )
+
+print(cor_labels)
+
+label_positions <- plot_dat %>%
+  group_by(measure) %>%
+  summarise(
+    x = quantile(BaselinepTau217, 0.05, na.rm = TRUE),
+    y = quantile(score, 0.95, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(cor_labels, by = "measure")
+
+# ============================================================
+# FACET PLOT
+# ============================================================
+
+p <- ggplot(plot_dat, aes(x = BaselinepTau217, y = score)) +
+  geom_point(alpha = 0.35, size = 1.4) +
+  geom_smooth(
+    method = "lm",
+    se = TRUE,
+    linewidth = 1
+  ) +
+  geom_text(
+    data = label_positions,
+    aes(x = x, y = y, label = label),
+    inherit.aes = FALSE,
+    hjust = 0,
+    vjust = 1,
+    size = 3.4
+  ) +
+  facet_wrap(~ measure, scales = "free_y", ncol = 3) +
+  labs(
+    x = "Baseline plasma pTau217",
+    y = "Baseline cognition score",
+    title = "Baseline C3 cognition measures vs baseline pTau217"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold", size = 12),
+    strip.background = element_blank()
+  )
+
+print(p)
+
+```
+
+
+
+```{r}
+#!/usr/bin/env Rscript
+
+# ============================================================
+# Longitudinal C3 cognition by Converter vs Nonconverter
+#   - Uses merged CSV:
+#     A4_c3_cdr_baseline_ptau217.csv
+#   - Defines A4 participants from any row with SUBSTUDY == "A4"
+#   - Requires participants to have CDGLOBAL at VISCODE 66
+#   - Converter = CDGLOBAL >= 0.5 at VISCODE 66
+#   - Nonconverter = CDGLOBAL < 0.5 at VISCODE 66
+#   - Plots all available C3 visits through VISCODE 66,
+#     even if CDR is missing at that visit
+#   - Prints plot only; does not save
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(tibble)
+})
+
+# ============================================================
+# PATH
+# ============================================================
+
+infile <- "/Users/caseyvanderlip/Library/CloudStorage/OneDrive-SharedLibraries-UCIrvine/Starklab - Documents/Casey/A4/shortertrials/data/A4_c3_cdr_baseline_ptau217.csv"
+
+# ============================================================
+# VARIABLES
+# ============================================================
+
+c3_vars <- c(
+  "BPXT",
+  "FNMT",
+  "OCL",
+  "DET",
+  "IDN",
+  "ONB",
+  "C3",
+  "C3Mem",
+  "C3NonMem"
+)
+
+measure_labels <- c(
+  BPXT = "BPXT",
+  FNMT = "FNMT",
+  OCL = "OCL",
+  DET = "DET",
+  IDN = "IDN",
+  ONB = "ONB",
+  C3 = "C3",
+  C3Mem = "C3 Memory",
+  C3NonMem = "C3 Non-Memory"
+)
+
+# ============================================================
+# READ DATA
+# ============================================================
+
+dat <- read_csv(infile, show_col_types = FALSE)
+
+required_cols <- c("BID", "VISCODE", "SUBSTUDY", "CDGLOBAL", c3_vars)
+
+missing_cols <- setdiff(required_cols, names(dat))
+
+if (length(missing_cols) > 0) {
+  stop(
+    "Missing required columns from merged file: ",
+    paste(missing_cols, collapse = ", ")
+  )
+}
+
+# ============================================================
+# CLEAN DATA
+# ============================================================
+
+dat_clean <- dat %>%
+  mutate(
+    BID = as.character(BID),
+    SUBSTUDY = as.character(SUBSTUDY),
+    VISCODE = suppressWarnings(as.numeric(VISCODE)),
+    CDGLOBAL = suppressWarnings(as.numeric(CDGLOBAL))
+  ) %>%
+  filter(
+    !is.na(BID),
+    !is.na(VISCODE),
+    VISCODE <= 66
+  )
+
+# ============================================================
+# DEFINE A4 PARTICIPANTS
+# ============================================================
+# Important:
+# SUBSTUDY may be missing on cognition-only rows after the full outer merge.
+# So define A4 status at the participant level first.
+
+a4_ids <- dat_clean %>%
+  filter(SUBSTUDY == "A4") %>%
+  distinct(BID)
+
+cat("\n[INFO] A4 participants identified:", nrow(a4_ids), "\n")
+
+# ============================================================
+# DEFINE CONVERTER STATUS AT VISCODE 66
+# ============================================================
+# Uses only A4 participants.
+# Requires CDGLOBAL at VISCODE 66.
+# Converter = CDGLOBAL >= 0.5 at VISCODE 66.
+
+converter_status <- dat_clean %>%
+  semi_join(a4_ids, by = "BID") %>%
+  filter(VISCODE == 66) %>%
+  filter(!is.na(CDGLOBAL)) %>%
+  group_by(BID) %>%
+  summarise(
+    CDGLOBAL_66 = max(CDGLOBAL, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    ConverterStatus = if_else(
+      CDGLOBAL_66 >= 0.5,
+      "Converter",
+      "Nonconverter"
+    ),
+    ConverterStatus = factor(
+      ConverterStatus,
+      levels = c("Nonconverter", "Converter")
+    )
+  )
+
+cat("[INFO] A4 participants with VISCODE 66 CDGLOBAL:", nrow(converter_status), "\n")
+cat("[INFO] Converter status counts:\n")
+print(table(converter_status$ConverterStatus, useNA = "ifany"))
+
+# ============================================================
+# KEEP ALL C3 VISITS THROUGH VISCODE 66 FOR ELIGIBLE SUBJECTS
+# ============================================================
+# This is the key change:
+# after converter status is defined, go back to all rows for those people
+# and keep C3 visits even if CDGLOBAL/CDR is missing at that visit.
+
+analysis_dat <- dat_clean %>%
+  semi_join(converter_status, by = "BID") %>%
+  left_join(converter_status, by = "BID") %>%
+  filter(
+    VISCODE <= 66,
+    if_any(all_of(c3_vars), ~ !is.na(.x))
+  )
+
+cat("\n[INFO] Longitudinal C3 rows among eligible A4 subjects:", nrow(analysis_dat), "\n")
+cat("[INFO] Unique eligible A4 subjects:", n_distinct(analysis_dat$BID), "\n")
+
+cat("\n[INFO] Visit distribution among eligible A4 subjects with any C3 data:\n")
+print(
+  analysis_dat %>%
+    count(VISCODE, sort = FALSE)
+)
+
+cat("\n[INFO] Visit distribution by converter status:\n")
+print(
+  analysis_dat %>%
+    count(VISCODE, ConverterStatus, sort = FALSE)
+)
+
+# ============================================================
+# LONG FORMAT
+# ============================================================
+
+plot_dat <- analysis_dat %>%
+  select(BID, VISCODE, ConverterStatus, all_of(c3_vars)) %>%
+  pivot_longer(
+    cols = all_of(c3_vars),
+    names_to = "measure",
+    values_to = "score"
+  ) %>%
+  mutate(
+    score = suppressWarnings(as.numeric(score)),
+    measure = factor(
+      measure,
+      levels = c3_vars,
+      labels = measure_labels[c3_vars]
+    )
+  ) %>%
+  filter(
+    !is.na(score),
+    !is.na(ConverterStatus)
+  )
+
+# ============================================================
+# SUMMARY DATA: MEAN AND SEM BY VISCODE/GROUP/MEASURE
+# ============================================================
+
+summary_dat <- plot_dat %>%
+  group_by(measure, VISCODE, ConverterStatus) %>%
+  summarise(
+    n = n_distinct(BID),
+    mean_score = mean(score, na.rm = TRUE),
+    sd_score = sd(score, na.rm = TRUE),
+    sem_score = sd_score / sqrt(n),
+    lower = mean_score - sem_score,
+    upper = mean_score + sem_score,
+    .groups = "drop"
+  )
+
+cat("\n[INFO] Summary sample sizes:\n")
+print(
+  summary_dat %>%
+    select(measure, VISCODE, ConverterStatus, n) %>%
+    arrange(measure, VISCODE, ConverterStatus)
+)
+
+# ============================================================
+# PLOT
+# ============================================================
+
+p <- ggplot(
+  summary_dat,
+  aes(
+    x = VISCODE,
+    y = mean_score,
+    group = ConverterStatus,
+    linetype = ConverterStatus,
+    shape = ConverterStatus
+  )
+) +
+  geom_ribbon(
+    aes(
+      ymin = lower,
+      ymax = upper,
+      fill = ConverterStatus
+    ),
+    alpha = 0.18,
+    color = NA
+  ) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.4) +
+  facet_wrap(~ measure, scales = "free_y", ncol = 3) +
+  scale_x_continuous(
+    breaks = sort(unique(summary_dat$VISCODE))
+  ) +
+  labs(
+    x = "VISCODE",
+    y = "Mean C3 cognition score ± SEM",
+    title = "Longitudinal C3 measures by conversion status",
+    linetype = "Group",
+    shape = "Group",
+    fill = "Group"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold", size = 12),
+    strip.background = element_blank(),
+    legend.title = element_text(face = "bold"),
+    legend.position = "top"
+  )
+
+print(p)
+```
+
